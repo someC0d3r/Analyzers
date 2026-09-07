@@ -12,12 +12,11 @@ namespace ALCops.Common.Settings;
 
 /// <summary>
 /// Shares successfully loaded settings across a workspace and keeps a consistent snapshot per
-/// compilation. Failed HTTP requests are retried by later compilations; cancellation is never cached.
+/// compilation. Failed HTTP requests are retried after a cooldown; cancellation is never cached.
 /// </summary>
 public static class ALCopsSettingsProvider
 {
-    private static readonly ConcurrentDictionary<string, ALCopsSettingsCacheEntry> _cache = new();
-    private static readonly ConditionalWeakTable<Compilation, ALCopsSettingsCacheEntry> _compilationCache = new();
+    private static readonly Cache _cache = new();
     private const string SettingsFileName = "alcops.json";
 
     public static ALCopsSettings GetSettings(Compilation compilation, CancellationToken cancellationToken) =>
@@ -25,8 +24,7 @@ public static class ALCopsSettingsProvider
 
     /// <summary>All callbacks for a compilation share the same settings and failures, independent of callback order.</summary>
     public static ALCopsSettingsLoadResult GetLoadResult(Compilation compilation, CancellationToken cancellationToken) =>
-        _compilationCache.GetValue(compilation, _ => new ALCopsSettingsCacheEntry()).GetOrLoad(
-            () => GetLoadResult(compilation.FileSystem, cancellationToken), cacheHttpFailures: true, cancellationToken);
+        _cache.GetLoadResult(compilation, cancellationToken);
 
     public static ALCopsSettings GetSettings(IFileSystem? fileSystem, CancellationToken cancellationToken = default) =>
         GetLoadResult(fileSystem, cancellationToken).Settings;
@@ -35,16 +33,30 @@ public static class ALCopsSettingsProvider
     /// Loads outside a compilation snapshot. Analyzer callbacks use the Compilation overload so
     /// failed HTTP requests are attempted at most once in each compilation, not once per callback.
     /// </summary>
-    public static ALCopsSettingsLoadResult GetLoadResult(IFileSystem? fileSystem, CancellationToken cancellationToken = default)
+    public static ALCopsSettingsLoadResult GetLoadResult(IFileSystem? fileSystem, CancellationToken cancellationToken = default) =>
+        _cache.GetLoadResult(fileSystem, cancellationToken);
+
+    /// <summary>Owns both cache lifetimes and a monotonic clock, allowing isolated deterministic retry tests.</summary>
+    internal sealed class Cache(Func<long>? getTickCount = null)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (fileSystem is null)
-            return Defaults();
-        string directoryPath = fileSystem.GetDirectoryPath();
-        if (string.IsNullOrEmpty(directoryPath))
-            return LoadSettingsFromFileSystem(fileSystem, directoryPath, cancellationToken);
-        return _cache.GetOrAdd(directoryPath, _ => new ALCopsSettingsCacheEntry()).GetOrLoad(
-            () => LoadSettingsFromFileSystem(fileSystem, directoryPath, cancellationToken), cacheHttpFailures: false, cancellationToken);
+        private readonly ConcurrentDictionary<string, ALCopsSettingsCacheEntry> _workspaces = new();
+        private readonly ConditionalWeakTable<Compilation, ALCopsSettingsCacheEntry> _compilations = new();
+
+        public ALCopsSettingsLoadResult GetLoadResult(Compilation compilation, CancellationToken cancellationToken) =>
+            _compilations.GetValue(compilation, _ => new ALCopsSettingsCacheEntry()).GetOrLoad(
+                () => GetLoadResult(compilation.FileSystem, cancellationToken), expireHttpFailures: false, cancellationToken);
+
+        public ALCopsSettingsLoadResult GetLoadResult(IFileSystem? fileSystem, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (fileSystem is null)
+                return Defaults();
+            string directoryPath = fileSystem.GetDirectoryPath();
+            if (string.IsNullOrEmpty(directoryPath))
+                return LoadSettingsFromFileSystem(fileSystem, directoryPath, cancellationToken);
+            return _workspaces.GetOrAdd(directoryPath, _ => new ALCopsSettingsCacheEntry(getTickCount)).GetOrLoad(
+                () => LoadSettingsFromFileSystem(fileSystem, directoryPath, cancellationToken), expireHttpFailures: true, cancellationToken);
+        }
     }
 
     private static ALCopsSettingsLoadResult Defaults() => new(new ALCopsSettings(), ImmutableArray<SettingsLoadFailure>.Empty);

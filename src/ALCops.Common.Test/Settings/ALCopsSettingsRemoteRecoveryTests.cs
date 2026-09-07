@@ -25,22 +25,53 @@ public class ALCopsSettingsRemoteRecoveryTests
     public void TearDown() => Directory.Delete(_tempRoot, recursive: true);
 
     [Test]
-    public async Task HttpFailure_IsRetriedByNextCompilation_AndSuccessIsCached()
+    public async Task HttpFailure_IsSharedAcrossCompilationsDuringCooldown()
     {
         await using var server = new SettingsServer(failFirst: true);
         var fileSystem = CreateFileSystem(server.Source);
 
         var first = await AnalyzeAsync(fileSystem).ConfigureAwait(false);
-        var second = await AnalyzeAsync(fileSystem).ConfigureAwait(false);
-        var third = await AnalyzeAsync(fileSystem).ConfigureAwait(false);
+        var later = await Task.WhenAll(Enumerable.Range(0, 12).Select(_ => AnalyzeAsync(fileSystem))).ConfigureAwait(false);
 
         Assert.Multiple(() =>
         {
             Assert.That(first.Select(d => d.Id), Is.EqualTo(new[] { DiagnosticIds.ConfigurationCouldNotBeLoaded }));
-            Assert.That(second, Is.Empty, "The recovered source must be retried without restarting the host.");
-            Assert.That(third, Is.Empty);
-            Assert.That(server.RequestCount, Is.EqualTo(2), "A successful retry must be cached.");
-            Assert.That(ALCopsSettingsProvider.GetSettings(fileSystem).CognitiveComplexityThreshold, Is.EqualTo(31));
+            foreach (var diagnostics in later)
+                Assert.That(diagnostics.Select(d => d.Id), Is.EqualTo(new[] { DiagnosticIds.ConfigurationCouldNotBeLoaded }));
+            Assert.That(server.RequestCount, Is.EqualTo(1), "Editing during the cooldown must not fetch again for every new compilation.");
+            Assert.That(ALCopsSettingsProvider.GetSettings(fileSystem).CognitiveComplexityThreshold, Is.EqualTo(15));
+        });
+    }
+
+    [Test]
+    public async Task HttpFailure_IsRetriedAfterCooldown_AndSuccessIsCached()
+    {
+        await using var server = new SettingsServer(failFirst: true);
+        var fileSystem = CreateFileSystem(server.Source);
+        long milliseconds = 0;
+        var cache = new ALCopsSettingsProvider.Cache(() => Interlocked.Read(ref milliseconds));
+
+        var first = cache.GetLoadResult(Compilation.Create("First", fileSystem: fileSystem), CancellationToken.None);
+        Interlocked.Exchange(ref milliseconds, 29_999);
+        var duringCooldown = cache.GetLoadResult(Compilation.Create("DuringCooldown", fileSystem: fileSystem), CancellationToken.None);
+        Interlocked.Exchange(ref milliseconds, 30_000);
+        var recovered = await Task.WhenAll(Enumerable.Range(0, 12).Select(index => Task.Run(() =>
+            cache.GetLoadResult(Compilation.Create($"Recovered{index}", fileSystem: fileSystem), CancellationToken.None)))).ConfigureAwait(false);
+        Interlocked.Exchange(ref milliseconds, 300_000);
+        var later = cache.GetLoadResult(Compilation.Create("Later", fileSystem: fileSystem), CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(first.Failures, Has.Length.EqualTo(1));
+            Assert.That(first.Settings.CognitiveComplexityThreshold, Is.EqualTo(15));
+            Assert.That(duringCooldown, Is.SameAs(first));
+            foreach (var result in recovered)
+            {
+                Assert.That(result.Failures, Is.Empty);
+                Assert.That(result.Settings.CognitiveComplexityThreshold, Is.EqualTo(31));
+                Assert.That(result, Is.SameAs(later));
+            }
+            Assert.That(server.RequestCount, Is.EqualTo(2), "Concurrent retries must share one fetch, and success must stay cached.");
         });
     }
 
@@ -95,19 +126,25 @@ public class ALCopsSettingsRemoteRecoveryTests
     {
         await using var server = new SettingsServer(failFirst: true);
         var fileSystem = CreateFileSystem(server.Source);
+        long milliseconds = 0;
+        var cache = new ALCopsSettingsProvider.Cache(() => milliseconds);
         var compilation = Compilation.Create("Snapshot", fileSystem: fileSystem);
-        var first = ALCopsSettingsProvider.GetLoadResult(compilation, CancellationToken.None);
-        var again = ALCopsSettingsProvider.GetLoadResult(compilation, CancellationToken.None);
+        var first = cache.GetLoadResult(compilation, CancellationToken.None);
+        var again = cache.GetLoadResult(compilation, CancellationToken.None);
         Assert.That(server.RequestCount, Is.EqualTo(1));
 
-        var next = await AnalyzeAsync(fileSystem).ConfigureAwait(false);
-        var original = ALCopsSettingsProvider.GetLoadResult(compilation, CancellationToken.None);
+        milliseconds = 30_000;
+        var afterExpiry = cache.GetLoadResult(compilation, CancellationToken.None);
+        Assert.That(server.RequestCount, Is.EqualTo(1), "Expiry alone must not refresh an existing compilation.");
+        var next = cache.GetLoadResult(Compilation.Create("Next", fileSystem: fileSystem), CancellationToken.None);
+        var original = cache.GetLoadResult(compilation, CancellationToken.None);
         Assert.Multiple(() =>
         {
             Assert.That(first.Failures, Has.Length.EqualTo(1));
             Assert.That(again, Is.SameAs(first));
+            Assert.That(afterExpiry, Is.SameAs(first));
             Assert.That(original, Is.SameAs(first));
-            Assert.That(next, Is.Empty);
+            Assert.That(next.Failures, Is.Empty);
             Assert.That(server.RequestCount, Is.EqualTo(2));
         });
     }

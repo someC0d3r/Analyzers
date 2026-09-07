@@ -37,6 +37,6 @@ public sealed class SettingsLoadFailure
     /// <summary>Human-readable reason; may contain OS-localized exception text.</summary>
     public string Detail { get; }
 
-    /// <summary>A failed HTTP request may succeed in a later compilation without restarting the host.</summary>
+    /// <summary>A failed HTTP request may be retried by a later compilation after the workspace cooldown.</summary>
     public bool RetryOnNextCompilation { get; }
 }
