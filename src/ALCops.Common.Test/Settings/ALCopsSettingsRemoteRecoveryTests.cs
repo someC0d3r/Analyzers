@@ -55,8 +55,14 @@ public class ALCopsSettingsRemoteRecoveryTests
         Interlocked.Exchange(ref milliseconds, 29_999);
         var duringCooldown = cache.GetLoadResult(Compilation.Create("DuringCooldown", fileSystem: fileSystem), CancellationToken.None);
         Interlocked.Exchange(ref milliseconds, 30_000);
-        var recovered = await Task.WhenAll(Enumerable.Range(0, 12).Select(index => Task.Run(() =>
-            cache.GetLoadResult(Compilation.Create($"Recovered{index}", fileSystem: fileSystem), CancellationToken.None)))).ConfigureAwait(false);
+        using var start = new Barrier(12);
+        // These synchronous callers block on HTTP or the workspace lock. Give them dedicated
+        // threads so their contention cannot starve the server's thread-pool continuations.
+        var recovered = await Task.WhenAll(Enumerable.Range(0, 12).Select(index => Task.Factory.StartNew(() =>
+        {
+            Assert.That(start.SignalAndWait(TimeSpan.FromSeconds(10)), Is.True, "All competing callers must reach the start barrier.");
+            return cache.GetLoadResult(Compilation.Create($"Recovered{index}", fileSystem: fileSystem), CancellationToken.None);
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default))).ConfigureAwait(false);
         Interlocked.Exchange(ref milliseconds, 300_000);
         var later = cache.GetLoadResult(Compilation.Create("Later", fileSystem: fileSystem), CancellationToken.None);
 
@@ -67,7 +73,7 @@ public class ALCopsSettingsRemoteRecoveryTests
             Assert.That(duringCooldown, Is.SameAs(first));
             foreach (var result in recovered)
             {
-                Assert.That(result.Failures, Is.Empty);
+                Assert.That(result.Failures.Select(failure => failure.Detail), Is.Empty);
                 Assert.That(result.Settings.CognitiveComplexityThreshold, Is.EqualTo(31));
                 Assert.That(result, Is.SameAs(later));
             }
@@ -254,6 +260,9 @@ public class ALCopsSettingsRemoteRecoveryTests
                     await using NetworkStream stream = client.GetStream();
                     using var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, leaveOpen: true);
                     while (!string.IsNullOrEmpty(await reader.ReadLineAsync(_shutdown.Token).ConfigureAwait(false))) { }
+                    // Require a queued continuation even when loopback I/O completes inline.
+                    // This exposes callers that starve the workers needed to serve a response.
+                    await Task.Yield();
                     int request = Interlocked.Increment(ref _requestCount);
                     byte[] body = "{\"CognitiveComplexityThreshold\":31}"u8.ToArray();
                     int status = failFirst && request == 1 ? 503 : 200;
